@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 
+import json
 import sys
 import re
 
+from itertools import islice
 from twitchdl import utils
 
 
@@ -51,8 +53,18 @@ def print_out(*args, **kwargs):
     print(*args, **kwargs)
 
 
+def print_json(data):
+    print(json.dumps(data))
+
+
 def print_err(*args, **kwargs):
     args = ["<red>{}</red>".format(a) for a in args]
+    args = [colorize(a) if USE_ANSI_COLOR else strip_tags(a) for a in args]
+    print(*args, file=sys.stderr, **kwargs)
+
+
+def print_log(*args, **kwargs):
+    args = ["<dim>{}</dim>".format(a) for a in args]
     args = [colorize(a) if USE_ANSI_COLOR else strip_tags(a) for a in args]
     print(*args, file=sys.stderr, **kwargs)
 
@@ -60,17 +72,76 @@ def print_err(*args, **kwargs):
 def print_video(video):
     published_at = video["publishedAt"].replace("T", " @ ").replace("Z", "")
     length = utils.format_duration(video["lengthSeconds"])
-    channel = video["creator"]["channel"]["displayName"]
-    playing = (
-        " playing <blue>{}</blue>".format(video["game"]["name"])
-        if video["game"] else ""
-    )
+
+    channel = "<blue>{}</blue>".format(video["creator"]["displayName"]) if video["creator"] else ""
+    playing = "playing <blue>{}</blue>".format(video["game"]["name"]) if video["game"] else ""
 
     # Can't find URL in video object, strange
     url = "https://www.twitch.tv/videos/{}".format(video["id"])
 
-    print_out("\n<b>{}</b>".format(video["id"]))
+    print_out("<b>Video {}</b>".format(video["id"]))
     print_out("<green>{}</green>".format(video["title"]))
-    print_out("<blue>{}</blue> {}".format(channel, playing))
+
+    if channel or playing:
+        print_out(" ".join([channel, playing]))
+
     print_out("Published <blue>{}</blue>  Length: <blue>{}</blue> ".format(published_at, length))
     print_out("<i>{}</i>".format(url))
+
+
+def print_paged_videos(generator, page_size, total_count):
+    iterator = iter(generator)
+    page = list(islice(iterator, page_size))
+
+    first = 1
+    last = first + len(page) - 1
+
+    while True:
+        print_out("-" * 80)
+
+        print_out()
+        for video in page:
+            print_video(video)
+            print_out()
+
+        last = first + len(page) - 1
+
+        print_out("-" * 80)
+        print_out("<yellow>Videos {}-{} of {}</yellow>".format(first, last, total_count))
+
+        first = first + len(page)
+        last = first + 1
+
+        page = list(islice(iterator, page_size))
+        if not page or not _continue():
+            break
+
+
+def print_clip(clip):
+    published_at = clip["createdAt"].replace("T", " @ ").replace("Z", "")
+    length = utils.format_duration(clip["durationSeconds"])
+    channel = clip["broadcaster"]["displayName"]
+    playing = (
+        "playing <blue>{}</blue>".format(clip["game"]["name"])
+        if clip["game"] else ""
+    )
+
+    print_out("Clip <b>{}</b>".format(clip["slug"]))
+    print_out("<green>{}</green>".format(clip["title"]))
+    print_out("<blue>{}</blue> {}".format(channel, playing))
+    print_out(
+        "Published <blue>{}</blue>"
+        "  Length: <blue>{}</blue>"
+        "  Views: <blue>{}</blue>".format(published_at, length, clip["viewCount"]))
+    print_out("<i>{}</i>".format(clip["url"]))
+
+
+def _continue():
+    print_out("Press <green><b>Enter</green> to continue, <yellow><b>Ctrl+C</yellow> to break.")
+
+    try:
+        input()
+    except KeyboardInterrupt:
+        return False
+
+    return True

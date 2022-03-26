@@ -7,82 +7,33 @@ import tempfile
 
 from os import path
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 
 from twitchdl import twitch, utils
 from twitchdl.download import download_file, download_files
 from twitchdl.exceptions import ConsoleError
-from twitchdl.output import print_out, print_video
-
-
-def _continue():
-    print_out(
-        "\nThere are more videos. "
-        "Press <green><b>Enter</green> to continue, "
-        "<yellow><b>Ctrl+C</yellow> to break."
-    )
-
-    try:
-        input()
-    except KeyboardInterrupt:
-        return False
-
-    return True
-
-
-def _get_game_ids(names):
-    if not names:
-        return []
-
-    game_ids = []
-    for name in names:
-        print_out("<dim>Looking up game '{}'...</dim>".format(name))
-        game_id = twitch.get_game_id(name)
-        if not game_id:
-            raise ConsoleError("Game '{}' not found".format(name))
-        game_ids.append(int(game_id))
-
-    return game_ids
-
-
-def videos(args):
-    game_ids = _get_game_ids(args.game)
-
-    print_out("<dim>Loading videos...</dim>")
-    generator = twitch.channel_videos_generator(
-        args.channel_name, args.limit, args.sort, args.type, game_ids=game_ids)
-
-    first = 1
-
-    for videos, has_more in generator:
-        count = len(videos["edges"]) if "edges" in videos else 0
-        total = videos["totalCount"]
-        last = first + count - 1
-
-        print_out("-" * 80)
-        print_out("<yellow>Showing videos {}-{} of {}</yellow>".format(first, last, total))
-
-        for video in videos["edges"]:
-            print_video(video["node"])
-
-        if not has_more or not _continue():
-            break
-
-        first += count
-    else:
-        print_out("<yellow>No videos found</yellow>")
+from twitchdl.output import print_out
 
 
 def _parse_playlists(playlists_m3u8):
     playlists = m3u8.loads(playlists_m3u8)
 
-    for p in playlists.playlists:
-        name = p.media[0].name if p.media else ""
-        resolution = "x".join(str(r) for r in p.stream_info.resolution)
-        yield name, resolution, p.uri
+    for p in sorted(playlists.playlists, key=lambda p: p.stream_info.resolution is None):
+        if p.stream_info.resolution:
+            name = p.media[0].name
+            description = "x".join(str(r) for r in p.stream_info.resolution)
+        else:
+            name = p.media[0].group_id
+            description = None
+
+        yield name, description, p.uri
 
 
 def _get_playlist_by_name(playlists, quality):
+    if quality == "source":
+        _, _, uri = playlists[0]
+        return uri
+
     for name, _, uri in playlists:
         if name == quality:
             return uri
@@ -95,22 +46,31 @@ def _get_playlist_by_name(playlists, quality):
 def _select_playlist_interactive(playlists):
     print_out("\nAvailable qualities:")
     for n, (name, resolution, uri) in enumerate(playlists):
-        print_out("{}) {} [{}]".format(n + 1, name, resolution))
+        if resolution:
+            print_out("{}) {} [{}]".format(n + 1, name, resolution))
+        else:
+            print_out("{}) {}".format(n + 1, name))
 
     no = utils.read_int("Choose quality", min=1, max=len(playlists) + 1, default=1)
     _, _, uri = playlists[no - 1]
     return uri
 
 
-def _join_vods(playlist_path, target):
+def _join_vods(playlist_path, target, overwrite, video):
     command = [
         "ffmpeg",
         "-i", playlist_path,
         "-c", "copy",
-        target,
+        "-metadata", "artist={}".format(video["creator"]["displayName"]),
+        "-metadata", "title={}".format(video["title"]),
+        "-metadata", "encoded_by=twitch-dl",
         "-stats",
         "-loglevel", "warning",
+        "file:{}".format(target),
     ]
+
+    if overwrite:
+        command.append("-y")
 
     print_out("<dim>{}</dim>".format(" ".join(command)))
     result = subprocess.run(command)
@@ -118,18 +78,59 @@ def _join_vods(playlist_path, target):
         raise ConsoleError("Joining files failed")
 
 
-def _video_target_filename(video, format):
-    match = re.search(r"^(\d{4})-(\d{2})-(\d{2})T", video['published_at'])
-    date = "".join(match.groups())
+def _video_target_filename(video, args):
+    date, time = video['publishedAt'].split("T")
+    game = video["game"]["name"] if video["game"] else "Unknown"
 
-    name = "_".join([
-        date,
-        video['_id'][1:],
-        video['channel']['name'],
-        utils.slugify(video['title']),
-    ])
+    subs = {
+        "channel": video["creator"]["displayName"],
+        "channel_login": video["creator"]["login"],
+        "date": date,
+        "datetime": video["publishedAt"],
+        "format": args.format,
+        "game": game,
+        "game_slug": utils.slugify(game),
+        "id": video["id"],
+        "time": time,
+        "title": utils.titlify(video["title"]),
+        "title_slug": utils.slugify(video["title"]),
+    }
 
-    return name + "." + format
+    try:
+        return args.output.format(**subs)
+    except KeyError as e:
+        supported = ", ".join(subs.keys())
+        raise ConsoleError("Invalid key {} used in --output. Supported keys are: {}".format(e, supported))
+
+
+def _clip_target_filename(clip, args):
+    date, time = clip["createdAt"].split("T")
+    game = clip["game"]["name"] if clip["game"] else "Unknown"
+
+    url = clip["videoQualities"][0]["sourceURL"]
+    _, ext = path.splitext(url)
+    ext = ext.lstrip(".")
+
+    subs = {
+        "channel": clip["broadcaster"]["displayName"],
+        "channel_login": clip["broadcaster"]["login"],
+        "date": date,
+        "datetime": clip["createdAt"],
+        "format": ext,
+        "game": game,
+        "game_slug": utils.slugify(game),
+        "id": clip["id"],
+        "slug": clip["slug"],
+        "time": time,
+        "title": utils.titlify(clip["title"]),
+        "title_slug": utils.slugify(clip["title"]),
+    }
+
+    try:
+        return args.output.format(**subs)
+    except KeyError as e:
+        supported = ", ".join(subs.keys())
+        raise ConsoleError("Invalid key {} used in --output. Supported keys are: {}".format(e, supported))
 
 
 def _get_vod_paths(playlist, start, end):
@@ -157,49 +158,36 @@ def _crete_temp_dir(base_uri):
     path = urlparse(base_uri).path.lstrip("/")
     temp_dir = Path(tempfile.gettempdir(), "twitch-dl", path)
     temp_dir.mkdir(parents=True, exist_ok=True)
-    return temp_dir
-
-
-VIDEO_PATTERNS = [
-    r"^(?P<id>\d+)?$",
-    r"^https://(www.)?twitch.tv/videos/(?P<id>\d+)(\?.+)?$",
-]
-
-CLIP_PATTERNS = [
-    r"^(?P<slug>[A-Za-z0-9]+)$",
-    r"^https://(www.)?twitch.tv/\w+/clip/(?P<slug>[A-Za-z0-9]+)(\?.+)?$",
-    r"^https://clips.twitch.tv/(?P<slug>[A-Za-z0-9]+)(\?.+)?$",
-]
+    return str(temp_dir)
 
 
 def download(args):
-    for pattern in VIDEO_PATTERNS:
-        match = re.match(pattern, args.video)
-        if match:
-            video_id = match.group('id')
-            return _download_video(video_id, args)
+    video_id = utils.parse_video_identifier(args.video)
+    if video_id:
+        return _download_video(video_id, args)
 
-    for pattern in CLIP_PATTERNS:
-        match = re.match(pattern, args.video)
-        if match:
-            clip_slug = match.group('slug')
-            return _download_clip(clip_slug, args)
+    clip_slug = utils.parse_clip_identifier(args.video)
+    if clip_slug:
+        return _download_clip(clip_slug, args)
 
-    raise ConsoleError("Invalid video: {}".format(args.video))
+    raise ConsoleError("Invalid input: {}".format(args.video))
 
 
-def _get_clip_url(clip, args):
+def _get_clip_url(clip, quality):
     qualities = clip["videoQualities"]
 
     # Quality given as an argument
-    if args.quality:
-        selected_quality = args.quality.rstrip("p")  # allow 720p as well as 720
+    if quality:
+        if quality == "source":
+            return qualities[0]["sourceURL"]
+
+        selected_quality = quality.rstrip("p")  # allow 720p as well as 720
         for q in qualities:
             if q["quality"] == selected_quality:
                 return q["sourceURL"]
 
         available = ", ".join([str(q["quality"]) for q in qualities])
-        msg = "Quality '{}' not found. Available qualities are: {}".format(args.quality, available)
+        msg = "Quality '{}' not found. Available qualities are: {}".format(quality, available)
         raise ConsoleError(msg)
 
     # Ask user to select quality
@@ -213,9 +201,27 @@ def _get_clip_url(clip, args):
     return selected_quality["sourceURL"]
 
 
+def get_clip_authenticated_url(slug, quality):
+    print_out("<dim>Fetching access token...</dim>")
+    access_token = twitch.get_clip_access_token(slug)
+
+    if not access_token:
+        raise ConsoleError("Access token not found for slug '{}'".format(slug))
+
+    url = _get_clip_url(access_token, quality)
+
+    query = urlencode({
+        "sig": access_token["playbackAccessToken"]["signature"],
+        "token": access_token["playbackAccessToken"]["value"],
+    })
+
+    return "{}?{}".format(url, query)
+
+
 def _download_clip(slug, args):
     print_out("<dim>Looking up clip...</dim>")
     clip = twitch.get_clip(slug)
+    game = clip["game"]["name"] if clip["game"] else "Unknown"
 
     if not clip:
         raise ConsoleError("Clip '{}' not found".format(slug))
@@ -223,25 +229,26 @@ def _download_clip(slug, args):
     print_out("Found: <green>{}</green> by <yellow>{}</yellow>, playing <blue>{}</blue> ({})".format(
         clip["title"],
         clip["broadcaster"]["displayName"],
-        clip["game"]["name"],
+        game,
         utils.format_duration(clip["durationSeconds"])
     ))
 
-    url = _get_clip_url(clip, args)
+    target = _clip_target_filename(clip, args)
+    print_out("Target: <blue>{}</blue>".format(target))
+
+    if not args.overwrite and path.exists(target):
+        response = input("File exists. Overwrite? [Y/n]: ")
+        if response.lower().strip() not in ["", "y"]:
+            raise ConsoleError("Aborted")
+        args.overwrite = True
+
+    url = get_clip_authenticated_url(slug, args.quality)
     print_out("<dim>Selected URL: {}</dim>".format(url))
 
-    url_path = urlparse(url).path
-    extension = Path(url_path).suffix
-    filename = "{}_{}{}".format(
-        clip["broadcaster"]["login"],
-        utils.slugify(clip["title"]),
-        extension
-    )
+    print_out("<dim>Downloading clip...</dim>")
+    download_file(url, target)
 
-    print_out("Downloading clip...")
-    download_file(url, filename)
-
-    print_out("Downloaded: {}".format(filename))
+    print_out("Downloaded: <blue>{}</blue>".format(target))
 
 
 def _download_video(video_id, args):
@@ -251,8 +258,20 @@ def _download_video(video_id, args):
     print_out("<dim>Looking up video...</dim>")
     video = twitch.get_video(video_id)
 
+    if not video:
+        raise ConsoleError("Video {} not found".format(video_id))
+
     print_out("Found: <blue>{}</blue> by <yellow>{}</yellow>".format(
-        video['title'], video['channel']['display_name']))
+        video['title'], video['creator']['displayName']))
+
+    target = _video_target_filename(video, args)
+    print_out("Output: <blue>{}</blue>".format(target))
+
+    if not args.overwrite and path.exists(target):
+        response = input("File exists. Overwrite? [Y/n]: ")
+        if response.lower().strip() not in ["", "y"]:
+            raise ConsoleError("Aborted")
+        args.overwrite = True
 
     print_out("<dim>Fetching access token...</dim>")
     access_token = twitch.get_access_token(video_id)
@@ -294,9 +313,13 @@ def _download_video(video_id, args):
     playlist_path = path.join(target_dir, "playlist_downloaded.m3u8")
     playlist.dump(playlist_path)
 
+    if args.no_join:
+        print_out("\n\n<dim>Skipping joining files...</dim>")
+        print_out("VODs downloaded to:\n<blue>{}</blue>".format(target_dir))
+        return
+
     print_out("\n\nJoining files...")
-    target = _video_target_filename(video, args.format)
-    _join_vods(playlist_path, target)
+    _join_vods(playlist_path, target, args.overwrite, video)
 
     if args.keep:
         print_out("\n<dim>Temporary files not deleted: {}</dim>".format(target_dir))

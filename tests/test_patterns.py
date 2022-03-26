@@ -1,10 +1,6 @@
 import pytest
 
-from unittest.mock import patch
-from twitchdl.commands import download
-from collections import namedtuple
-
-Args = namedtuple("args", ["video"])
+from twitchdl.utils import parse_video_identifier, parse_clip_identifier
 
 
 TEST_VIDEO_PATTERNS = [
@@ -22,24 +18,18 @@ TEST_CLIP_PATTERNS = {
     ("HungryProudRadicchioDoggo", "https://clips.twitch.tv/HungryProudRadicchioDoggo"),
     ("HungryProudRadicchioDoggo", "https://www.twitch.tv/bananasaurus_rex/clip/HungryProudRadicchioDoggo?filter=clips&range=7d&sort=time"),
     ("HungryProudRadicchioDoggo", "https://twitch.tv/bananasaurus_rex/clip/HungryProudRadicchioDoggo?filter=clips&range=7d&sort=time"),
+    ("GloriousColdbloodedTortoiseRuleFive-E017utJ4DZmHVpfQ", "GloriousColdbloodedTortoiseRuleFive-E017utJ4DZmHVpfQ"),
+    ("GloriousColdbloodedTortoiseRuleFive-E017utJ4DZmHVpfQ", "https://twitch.tv/dracul1nx/clip/GloriousColdbloodedTortoiseRuleFive-E017utJ4DZmHVpfQ"),
+    ("GloriousColdbloodedTortoiseRuleFive-E017utJ4DZmHVpfQ", "https://twitch.tv/dracul1nx/clip/GloriousColdbloodedTortoiseRuleFive-E017utJ4DZmHVpfQ?filter=clips&range=7d&sort=time"),
+    ("GloriousColdbloodedTortoiseRuleFive-E017utJ4DZmHVpfQ", "https://www.twitch.tv/dracul1nx/clip/GloriousColdbloodedTortoiseRuleFive-E017utJ4DZmHVpfQ?filter=clips&range=7d&sort=time"),
 }
 
 
-@patch("twitchdl.commands._download_clip")
-@patch("twitchdl.commands._download_video")
 @pytest.mark.parametrize("expected,input", TEST_VIDEO_PATTERNS)
-def test_video_patterns(video_dl, clip_dl, expected, input):
-    args = Args(video=input)
-    download(args)
-    video_dl.assert_called_once_with(expected, args)
-    clip_dl.assert_not_called()
+def test_video_patterns(expected, input):
+    assert parse_video_identifier(input) == expected
 
 
-@patch("twitchdl.commands._download_clip")
-@patch("twitchdl.commands._download_video")
 @pytest.mark.parametrize("expected,input", TEST_CLIP_PATTERNS)
-def test_clip_patterns(video_dl, clip_dl, expected, input):
-    args = Args(video=input)
-    download(args)
-    clip_dl.assert_called_once_with(expected, args)
-    video_dl.assert_not_called()
+def test_clip_patterns(expected, input):
+    assert parse_clip_identifier(input) == expected

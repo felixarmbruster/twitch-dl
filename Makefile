@@ -1,3 +1,5 @@
+.PHONY: docs
+
 default : clean dist
 
 dist :
@@ -6,7 +8,7 @@ dist :
 
 clean :
 	find . -name "*pyc" | xargs rm -rf $1
-	rm -rf build dist bundle MANIFEST htmlcov deb_dist twitch-dl*.tar.gz twitch-dl.1.man
+	rm -rf build dist bundle MANIFEST htmlcov deb_dist twitch-dl.*.pyz twitch-dl.1.man
 
 bundle:
 	mkdir bundle
@@ -25,11 +27,22 @@ publish :
 coverage:
 	py.test --cov=toot --cov-report html tests/
 
-deb:
-	@python setup.py --command-packages=stdeb.command bdist_deb
-
 man:
 	scdoc < twitch-dl.1.scd > twitch-dl.1.man
 
 test:
 	pytest
+
+changelog:
+	./scripts/generate_changelog > CHANGELOG.md
+
+docs: changelog
+	python scripts/generate_docs
+	mdbook build
+
+docs-serve:
+	python scripts/generate_docs
+	mdbook serve --port 8000
+
+docs-deploy: docs
+	rsync --archive --compress --delete --stats book/ bezdomni:web/twitch-dl

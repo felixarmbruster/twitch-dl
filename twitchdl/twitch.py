@@ -42,13 +42,14 @@ def authenticated_post(url, data=None, json=None, headers={}):
     return response
 
 
-def kraken_get(url, params={}, headers={}):
-    """
-    Add accept header required by kraken API v5.
-    see: https://discuss.dev.twitch.tv/t/change-in-access-to-deprecated-kraken-twitch-apis/22241
-    """
-    headers["Accept"] = "application/vnd.twitchtv.v5+json"
-    return authenticated_get(url, params, headers)
+def gql_post(query):
+    url = "https://gql.twitch.tv/gql"
+    response = authenticated_post(url, data=query).json()
+
+    if "errors" in response:
+        raise GQLError(response["errors"])
+
+    return response
 
 
 def gql_query(query):
@@ -61,39 +62,177 @@ def gql_query(query):
     return response
 
 
-def get_video(video_id):
-    """
-    https://dev.twitch.tv/docs/v5/reference/videos#get-video
-    """
-    url = "https://api.twitch.tv/kraken/videos/{}".format(video_id)
+VIDEO_FIELDS = """
+    id
+    title
+    publishedAt
+    broadcastType
+    lengthSeconds
+    game {
+        name
+    }
+    creator {
+        login
+        displayName
+    }
+"""
 
-    return kraken_get(url).json()
+
+CLIP_FIELDS = """
+    id
+    slug
+    title
+    createdAt
+    viewCount
+    durationSeconds
+    url
+    videoQualities {
+        frameRate
+        quality
+        sourceURL
+    }
+    game {
+        id
+        name
+    }
+    broadcaster {
+        displayName
+        login
+    }
+"""
+
+
+def get_video(video_id):
+    query = """
+    {{
+        video(id: "{video_id}") {{
+            {fields}
+        }}
+    }}
+    """
+
+    query = query.format(video_id=video_id, fields=VIDEO_FIELDS)
+
+    response = gql_query(query)
+    return response["data"]["video"]
 
 
 def get_clip(slug):
     query = """
     {{
         clip(slug: "{}") {{
-            title
-            durationSeconds
-            game {{
-                name
-            }}
-            broadcaster {{
-                login
-                displayName
-            }}
-            videoQualities {{
-                frameRate
-                quality
-                sourceURL
+            {fields}
+        }}
+    }}
+    """
+
+    response = gql_query(query.format(slug, fields=CLIP_FIELDS))
+    return response["data"]["clip"]
+
+
+def get_clip_access_token(slug):
+    query = """
+    {{
+        "operationName": "VideoAccessToken_Clip",
+        "variables": {{
+            "slug": "{slug}"
+        }},
+        "extensions": {{
+            "persistedQuery": {{
+                "version": 1,
+                "sha256Hash": "36b89d2507fce29e5ca551df756d27c1cfe079e2609642b4390aa4c35796eb11"
             }}
         }}
     }}
     """
 
-    response = gql_query(query.format(slug))
+    response = gql_post(query.format(slug=slug).strip())
     return response["data"]["clip"]
+
+
+def get_channel_clips(channel_id, period, limit, after=None):
+    """
+    List channel clips.
+
+    At the time of writing this:
+    * filtering by game name returns an error
+    * sorting by anything but VIEWS_DESC or TRENDING returns an error
+    * sorting by VIEWS_DESC and TRENDING returns the same results
+    * there is no totalCount
+    """
+    query = """
+    {{
+      user(login: "{channel_id}") {{
+        clips(first: {limit}, after: "{after}", criteria: {{ period: {period}, sort: VIEWS_DESC }}) {{
+          pageInfo {{
+            hasNextPage
+            hasPreviousPage
+          }}
+          edges {{
+            cursor
+            node {{
+              {fields}
+            }}
+          }}
+        }}
+      }}
+    }}
+    """
+
+    query = query.format(
+        channel_id=channel_id,
+        after=after if after else "",
+        limit=limit,
+        period=period.upper(),
+        fields=CLIP_FIELDS
+    )
+
+    response = gql_query(query)
+    user = response["data"]["user"]
+    if not user:
+        raise ConsoleError("Channel {} not found".format(channel_id))
+
+    return response["data"]["user"]["clips"]
+
+
+def channel_clips_generator(channel_id, period, limit):
+    def _generator(clips, limit):
+        for clip in clips["edges"]:
+            if limit < 1:
+                return
+            yield clip["node"]
+            limit -= 1
+
+        has_next = clips["pageInfo"]["hasNextPage"]
+        if limit < 1 or not has_next:
+            return
+
+        req_limit = min(limit, 100)
+        cursor = clips["edges"][-1]["cursor"]
+        clips = get_channel_clips(channel_id, period, req_limit, cursor)
+        yield from _generator(clips, limit)
+
+    req_limit = min(limit, 100)
+    clips = get_channel_clips(channel_id, period, req_limit)
+    return _generator(clips, limit)
+
+
+def channel_clips_generator_old(channel_id, period, limit):
+    cursor = ""
+    while True:
+        clips = get_channel_clips(
+            channel_id, period, limit, after=cursor)
+
+        if not clips["edges"]:
+            break
+
+        has_next = clips["pageInfo"]["hasNextPage"]
+        cursor = clips["edges"][-1]["cursor"] if has_next else None
+
+        yield clips, has_next
+
+        if not cursor:
+            break
 
 
 def get_channel_videos(channel_id, limit, sort, type="archive", game_ids=[], after=None):
@@ -116,19 +255,7 @@ def get_channel_videos(channel_id, limit, sort, type="archive", game_ids=[], aft
                 edges {{
                     cursor
                     node {{
-                        id
-                        title
-                        publishedAt
-                        broadcastType
-                        lengthSeconds
-                        game {{
-                            name
-                        }}
-                        creator {{
-                            channel {{
-                                displayName
-                            }}
-                        }}
+                        {fields}
                     }}
                 }}
             }}
@@ -136,41 +263,67 @@ def get_channel_videos(channel_id, limit, sort, type="archive", game_ids=[], aft
     }}
     """
 
-    query = query.format(**{
-        "channel_id": channel_id,
-        "game_ids": game_ids,
-        "after": after,
-        "limit": limit,
-        "sort": sort.upper(),
-        "type": type.upper(),
-    })
+    query = query.format(
+        channel_id=channel_id,
+        game_ids=game_ids,
+        after=after if after else "",
+        limit=limit,
+        sort=sort.upper(),
+        type=type.upper(),
+        fields=VIDEO_FIELDS
+    )
 
     response = gql_query(query)
+
+    if not response["data"]["user"]:
+        raise ConsoleError("Channel {} not found".format(channel_id))
+
     return response["data"]["user"]["videos"]
 
 
-def channel_videos_generator(channel_id, limit, sort, type, game_ids=None):
-    cursor = None
-    while True:
-        videos = get_channel_videos(
-            channel_id, limit, sort, type, game_ids=game_ids, after=cursor)
-
-        if not videos["edges"]:
-            break
+def channel_videos_generator(channel_id, max_videos, sort, type, game_ids=None):
+    def _generator(videos, max_videos):
+        for video in videos["edges"]:
+            if max_videos < 1:
+                return
+            yield video["node"]
+            max_videos -= 1
 
         has_next = videos["pageInfo"]["hasNextPage"]
-        cursor = videos["edges"][-1]["cursor"] if has_next else None
+        if max_videos < 1 or not has_next:
+            return
 
-        yield videos, has_next
+        limit = min(max_videos, 100)
+        cursor = videos["edges"][-1]["cursor"]
+        videos = get_channel_videos(channel_id, limit, sort, type, game_ids, cursor)
+        yield from _generator(videos, max_videos)
 
-        if not cursor:
-            break
+    limit = min(max_videos, 100)
+    videos = get_channel_videos(channel_id, limit, sort, type, game_ids)
+    return videos["totalCount"], _generator(videos, max_videos)
 
 
 def get_access_token(video_id):
-    url = "https://api.twitch.tv/api/vods/{}/access_token".format(video_id)
+    query = """
+    {{
+        videoPlaybackAccessToken(
+            id: {video_id},
+            params: {{
+                platform: "web",
+                playerBackend: "mediaplayer",
+                playerType: "site"
+            }}
+        ) {{
+            signature
+            value
+        }}
+    }}
+    """
 
-    return authenticated_get(url).json()
+    query = query.format(video_id=video_id)
+
+    response = gql_query(query)
+    return response["data"]["videoPlaybackAccessToken"]
 
 
 def get_playlists(video_id, access_token):
@@ -180,8 +333,9 @@ def get_playlists(video_id, access_token):
     url = "http://usher.twitch.tv/vod/{}".format(video_id)
 
     response = requests.get(url, params={
-        "nauth": access_token['token'],
-        "nauthsig": access_token['sig'],
+        "nauth": access_token['value'],
+        "nauthsig": access_token['signature'],
+        "allow_audio_only": "true",
         "allow_source": "true",
         "player": "twitchweb",
     })

@@ -13,3 +13,5 @@ tmp/
 /twitch-dl.1.man
 /bundle
 /*.pyz
+/pyrightconfig.json
+/book
